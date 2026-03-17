@@ -3,7 +3,7 @@ import traceback
 import numpy as np
 import torch
 
-from .utils import log
+from .utils import log, _cap_num_buffers
 from rlcard.utils import run_game_pettingzoo
 
 def create_buffers_pettingzoo(
@@ -11,9 +11,15 @@ def create_buffers_pettingzoo(
     num_buffers,
     env,
     device_iterator,
+    pin_memory=False,
 ):
+    devices = list(device_iterator)
+    num_agents = len(env.agents)
+    spec_count = 5
+    per_buffer_objects = max(1, len(devices) * num_agents * spec_count)
+    num_buffers = _cap_num_buffers(num_buffers, per_buffer_objects)
     buffers = {}
-    for device in device_iterator:
+    for device in devices:
         buffers[device] = []
         for agent_name in env.agents:
             state_shape = env.observation_space(agent_name)["observation"].shape
@@ -27,13 +33,23 @@ def create_buffers_pettingzoo(
             _buffers = {key: [] for key in specs}
             for _ in range(num_buffers):
                 for key in _buffers:
-                    if device == "cpu":
-                        _buffer = torch.empty(**specs[key]).to('cpu').share_memory_()
-                    else:
-                        _buffer = torch.empty(**specs[key]).to('cuda:'+str(device)).share_memory_()
+                    try:
+                        _buffer = torch.empty(
+                            **specs[key],
+                            pin_memory=pin_memory,
+                        ).share_memory_()
+                    except (TypeError, RuntimeError):
+                        if pin_memory:
+                            log.warning(
+                                "Pinned memory is not available. Falling back to regular CPU buffers."
+                            )
+                            pin_memory = False
+                            _buffer = torch.empty(**specs[key]).share_memory_()
+                        else:
+                            raise
                     _buffers[key].append(_buffer)
             buffers[device].append(_buffers)
-    return buffers
+    return buffers, num_buffers
 
 def _get_action_feature(action, action_space):
     out = np.zeros(action_space)

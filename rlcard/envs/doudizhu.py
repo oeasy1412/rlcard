@@ -133,7 +133,7 @@ class DoudizhuEnv(Env):
         state['legal_actions'] = self.game.state['actions']
         return state
 
-    def get_action_feature(self, action):
+    def get_action_feature(self, action, state=None):
         ''' For some environments such as DouDizhu, we can have action features
 
         Returns:

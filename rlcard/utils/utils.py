@@ -164,13 +164,52 @@ def reorganize(trajectories, payoffs):
     num_players = len(trajectories)
     new_trajectories = [[] for _ in range(num_players)]
 
+    def _chudadi_low_single_reward(state, action):
+        raw_obs = state.get('raw_obs')
+        if not isinstance(raw_obs, dict):
+            return 0.0
+        if not all(
+            key in raw_obs
+            for key in (
+                'current_hand',
+                'last_action_type',
+                'last_action_length',
+                'is_first_trick',
+            )
+        ):
+            return 0.0
+        try:
+            action_id = int(action)
+        except (TypeError, ValueError):
+            return 0.0
+        if action_id == 0:
+            return 0.0
+        if action_id & (action_id - 1) != 0:
+            return 0.0
+        from rlcard.games.chudadi.utils import action_id_to_cards
+        cards = action_id_to_cards(action_id)
+        if len(cards) != 1:
+            return 0.0
+        card = cards[0]
+        if card.rank not in ('3', '4', '5'):
+            return 0.0
+        hand = raw_obs.get('current_hand') or []
+        rank_count = sum(1 for c in hand if c.rank == card.rank)
+        if rank_count != 1:
+            return 0.0
+        return 0.01
+
     for player in range(num_players):
         for i in range(0, len(trajectories[player])-2, 2):
             if i ==len(trajectories[player])-3:
                 reward = payoffs[player]
-                done =True
+                done = True
             else:
                 reward, done = 0, False
+            reward += _chudadi_low_single_reward(
+                trajectories[player][i],
+                trajectories[player][i + 1],
+            )
             transition = trajectories[player][i:i+3].copy()
             transition.insert(2, reward)
             transition.append(done)
@@ -248,4 +287,3 @@ def plot_curve(csv_path, save_path, algorithm):
             os.makedirs(save_dir)
 
         fig.savefig(save_path)
-

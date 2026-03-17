@@ -214,7 +214,7 @@ class Env(object):
         '''
         raise NotImplementedError
 
-    def get_action_feature(self, action):
+    def get_action_feature(self, action, state=None):
         ''' For some environments such as DouDizhu, we can have action features
 
         Returns:

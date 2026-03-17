@@ -1,12 +1,12 @@
 # Copyright 2021 RLCard Team of Texas A&M University
 # Copyright 2021 DouZero Team of Kwai
-# 
+#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-# 
+#
 #    http://www.apache.org/licenses/LICENSE-2.0
-# 
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -14,6 +14,10 @@
 # limitations under the License.
 
 import logging
+try:
+    import resource
+except ImportError:  # Windows does not provide `resource`.
+    resource = None
 import traceback
 
 import numpy as np
@@ -46,34 +50,74 @@ def get_batch(
         free_queue.put(m)
     return batch
 
+def _cap_num_buffers(num_buffers, per_buffer_objects):
+    if resource is None:
+        return num_buffers
+    try:
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except Exception:
+        return num_buffers
+    reserve = 16
+    if soft_limit <= reserve:
+        return max(1, min(num_buffers, 1))
+    max_buffers = max(1, (soft_limit - reserve) // per_buffer_objects)
+    if max_buffers < num_buffers:
+        log.warning(
+            "Capping num_buffers from %d to %d due to RLIMIT_NOFILE=%d. "
+            "Consider increasing ulimit -Sn (e.g., 4096 65535).",
+            num_buffers,
+            max_buffers,
+            soft_limit,
+        )
+        return max_buffers
+    return num_buffers
+
+
 def create_buffers(
     T,
     num_buffers,
     state_shape,
     action_shape,
     device_iterator,
+    pin_memory=False,
 ):
+    devices = list(device_iterator)
+    num_players = len(state_shape)
+    spec_count = 5
+    per_buffer_objects = max(1, len(devices) * num_players * spec_count)
+    num_buffers = _cap_num_buffers(num_buffers, per_buffer_objects)
     buffers = {}
-    for device in device_iterator:
+    for device in devices:
         buffers[device] = []
         for player_id in range(len(state_shape)):
             specs = dict(
                 done=dict(size=(T,), dtype=torch.bool),
                 episode_return=dict(size=(T,), dtype=torch.float32),
                 target=dict(size=(T,), dtype=torch.float32),
-                state=dict(size=(T,)+tuple(state_shape[player_id]), dtype=torch.int8),
-                action=dict(size=(T,)+tuple(action_shape[player_id]), dtype=torch.int8),
+                state=dict(size=(T,) + tuple(state_shape[player_id]), dtype=torch.int8),
+                action=dict(size=(T,) + tuple(action_shape[player_id]), dtype=torch.int8),
             )
             _buffers = {key: [] for key in specs}
+            use_pin_memory = pin_memory
             for _ in range(num_buffers):
                 for key in _buffers:
-                    if device == "cpu":
-                        _buffer = torch.empty(**specs[key]).to('cpu').share_memory_()
-                    else:
-                        _buffer = torch.empty(**specs[key]).to('cuda:'+str(device)).share_memory_()
+                    try:
+                        _buffer = torch.empty(
+                            **specs[key],
+                            pin_memory=use_pin_memory,
+                        ).share_memory_()
+                    except (TypeError, RuntimeError):
+                        if use_pin_memory:
+                            log.warning(
+                                "Pinned memory is not available. Falling back to regular CPU buffers."
+                            )
+                            use_pin_memory = False
+                            _buffer = torch.empty(**specs[key]).share_memory_()
+                        else:
+                            raise
                     _buffers[key].append(_buffer)
             buffers[device].append(_buffers)
-    return buffers
+    return buffers, num_buffers
 
 def create_optimizers(
     num_players,
@@ -131,9 +175,10 @@ def act(
                     target_buf[p].extend([float(payoffs[p]) for _ in range(diff)])
                     # State and action
                     for i in range(0, len(trajectories[p])-2, 2):
-                        state = trajectories[p][i]['obs']
-                        action = env.get_action_feature(trajectories[p][i+1])
-                        state_buf[p].append(torch.from_numpy(state))
+                        state = trajectories[p][i]
+                        obs = state['obs']
+                        action = env.get_action_feature(trajectories[p][i+1], state)
+                        state_buf[p].append(torch.from_numpy(obs))
                         action_buf[p].append(torch.from_numpy(action))
                 
                 while size[p] > T:

@@ -56,11 +56,11 @@ def learn(
 ):
     """Performs a learning (optimization) step."""
     device = "cuda:"+str(training_device) if training_device != "cpu" else "cpu"
-    state = torch.flatten(batch['state'].to(device), 0, 1).float()
-    action = torch.flatten(batch['action'].to(device), 0, 1).float()
-    target = torch.flatten(batch['target'].to(device), 0, 1)
+    state = torch.flatten(batch['state'].to(device, non_blocking=True), 0, 1).float()
+    action = torch.flatten(batch['action'].to(device, non_blocking=True), 0, 1).float()
+    target = torch.flatten(batch['target'].to(device, non_blocking=True), 0, 1)
     episode_returns = batch['episode_return'][batch['done']]
-    mean_episode_return_buf[position].append(torch.mean(episode_returns).to(device))
+    mean_episode_return_buf[position].append(torch.mean(episode_returns))
 
     with lock:
         values = agent.forward(state, action)
@@ -137,7 +137,7 @@ class DMCTrainer:
         )
 
         self.checkpointpath = os.path.expandvars(
-            os.path.expanduser('%s/%s/%s' % (savedir, xpid, 'model.tar')))
+            os.path.expanduser('%s/%s/%s' % (savedir, xpid, 'model.tar'))) # tar
 
         self.T = unroll_length
         self.B = batch_size
@@ -202,20 +202,23 @@ class DMCTrainer:
             models[device] = model
 
         # Initialize buffers
+        pin_memory = self.training_device != "cpu"
         if not self.is_pettingzoo_env:
-            buffers = create_buffers(
+            buffers, self.num_buffers = create_buffers(
                 self.T,
                 self.num_buffers,
                 self.env.state_shape,
                 self.action_shape,
                 self.device_iterator,
+                pin_memory=pin_memory,
             )
         else:
-            buffers = create_buffers_pettingzoo(
+            buffers, self.num_buffers = create_buffers_pettingzoo(
                 self.T,
                 self.num_buffers,
                 self.env,
                 self.device_iterator,
+                pin_memory=pin_memory,
             )
 
         # Initialize queues
