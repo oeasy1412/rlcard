@@ -28,6 +28,7 @@ START_CARD = Card("D", "3")
 ACTION_TYPES = [
     "single",
     "pair",
+    "triple",
     "straight",
     "flush",
     "full_house",
@@ -36,7 +37,6 @@ ACTION_TYPES = [
 ]
 
 ACTION_TYPE_PRIORITY = {name: idx for idx, name in enumerate(ACTION_TYPES)}
-
 MASK_INDICES_CACHE = {}
 
 
@@ -145,6 +145,17 @@ def make_action(cards):
             cards_to_str(cards, assume_sorted=True),
         )
 
+    if length == 3 and unique_ranks == 1:
+        rank_value = RANK_TO_VALUE[ranks[0]]
+        max_suit = SUIT_TO_VALUE[cards[-1].suit]
+        return Action(
+            tuple(cards),
+            "triple",
+            length,
+            (rank_value, max_suit),
+            cards_to_str(cards, assume_sorted=True),
+        )
+
     if length == 5:
         if is_straight and is_flush:
             max_card = cards[-1]
@@ -210,7 +221,7 @@ def action_to_feature_meta(cards):
     main_rank = None
     kicker_rank = None
 
-    if action_type in ("single", "pair"):
+    if action_type in ("single", "pair", "triple"):
         main_rank = action.cards[0].rank
     elif action_type in ("straight", "flush", "straight_flush"):
         max_card = _get_max_card(action.cards)
@@ -241,14 +252,57 @@ def action_to_feature_meta(cards):
     return action_type, main_index, kicker_index
 
 
-def can_beat(action, last_action):
+def can_beat(action, last_action, northern_rule=True):
     if last_action is None:
         return True
+
+    # 南方规则：铁支和同花顺有特殊压制能力，其余牌型必须同类型比较
+    if not northern_rule:
+        # 同花顺可压任意牌型
+        if action.action_type == "straight_flush":
+            if last_action.action_type == "straight_flush":
+                return action.key > last_action.key
+            else:
+                return True
+        # 铁支可压除同花顺外的任意牌型
+        if action.action_type == "four_of_a_kind":
+            if last_action.action_type == "straight_flush":
+                return False
+            elif last_action.action_type == "four_of_a_kind":
+                return action.key > last_action.key
+            else:
+                return True
+        # 南方规则：普通牌型必须同类型比较
+        if action.action_type != last_action.action_type:
+            return False
+        return action.key > last_action.key
+
+    # 北方规则：五张牌型可以相互压制
+    five_card_types = (
+        "straight",
+        "flush",
+        "full_house",
+        "four_of_a_kind",
+        "straight_flush",
+    )
+    is_five_card_action = action.action_type in five_card_types
+    is_five_card_last = last_action.action_type in five_card_types
+
+    if is_five_card_action and is_five_card_last:
+        # 五张牌型可以相互压制，按类型优先级
+        action_priority = ACTION_TYPE_PRIORITY.get(action.action_type, -1)
+        last_priority = ACTION_TYPE_PRIORITY.get(last_action.action_type, -1)
+        if action_priority > last_priority:
+            return True
+        elif action_priority < last_priority:
+            return False
+        else:
+            # 相同类型，比较key
+            return action.key > last_action.key
+
+    # 其他牌型必须同类型才能比较
     if action.action_type != last_action.action_type:
         return False
-    if action.action_type in ("straight", "flush", "straight_flush"):
-        if action.length != last_action.length:
-            return False
     return action.key > last_action.key
 
 
@@ -295,6 +349,24 @@ def _generate_valid_actions(hand):
                 )
             )
             continue
+        if length == 3:
+            card1 = cards[indices[0]]
+            card2 = cards[indices[1]]
+            card3 = cards[indices[2]]
+            if card1.rank != card2.rank or card2.rank != card3.rank:
+                continue
+            max_suit = SUIT_TO_VALUE[card3.suit]
+            rank_value = RANK_TO_VALUE[card1.rank]
+            actions.append(
+                Action(
+                    (card1, card2, card3),
+                    "triple",
+                    3,
+                    (rank_value, max_suit),
+                    cards_to_str((card1, card2, card3), assume_sorted=True),
+                )
+            )
+            continue
         if length < 5:
             continue
         if length > 5:
@@ -306,15 +378,74 @@ def _generate_valid_actions(hand):
     return actions
 
 
-def get_legal_actions(hand, last_action, must_contain_card=False):
+def get_legal_actions(hand, last_action, must_contain_card=False, northern_rule=True):
+    """Get legal actions for the player.
+    Args:
+        hand: Player's current hand
+        last_action: The last action played
+        must_contain_card: Whether the action must contain the start card (D3)
+        northern_rule: If True, apply northern rule (must play if can beat same type)
+    Returns:
+        List of legal Action objects
+    """
     actions = _generate_valid_actions(hand)
     if must_contain_card:
         actions = [action for action in actions if START_CARD in action.cards]
 
     if last_action is not None:
-        actions = [action for action in actions if can_beat(action, last_action)]
-        if not actions:
-            actions = [PASS_ACTION]
+        beatable_actions = [
+            action for action in actions if can_beat(action, last_action, northern_rule)
+        ]
+
+        if northern_rule:
+            # Northern rule: must play same type if can beat
+            five_card_types = (
+                "straight",
+                "flush",
+                "full_house",
+                "four_of_a_kind",
+                "straight_flush",
+            )
+            if last_action.action_type in five_card_types:
+                # For five-card hands, all five-card types are considered the same category
+                has_same_type_beat = any(
+                    action.action_type in five_card_types for action in beatable_actions
+                )
+                if has_same_type_beat:
+                    actions = [
+                        action
+                        for action in beatable_actions
+                        if action.action_type in five_card_types
+                    ]
+                else:
+                    actions = (
+                        beatable_actions + [PASS_ACTION]
+                        if beatable_actions
+                        else [PASS_ACTION]
+                    )
+            else:
+                has_same_type_beat = any(
+                    action.action_type == last_action.action_type
+                    for action in beatable_actions
+                )
+                if has_same_type_beat:
+                    actions = [
+                        action
+                        for action in beatable_actions
+                        if action.action_type == last_action.action_type
+                    ]
+                else:
+                    actions = (
+                        beatable_actions + [PASS_ACTION]
+                        if beatable_actions
+                        else [PASS_ACTION]
+                    )
+        else:
+            # Southern rule: any beating action is valid (including special five-card types)
+            if beatable_actions:
+                actions = beatable_actions + [PASS_ACTION]
+            else:
+                actions = [PASS_ACTION]
 
     actions.sort(
         key=lambda action: (
